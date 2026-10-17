@@ -16,6 +16,19 @@ PLANS = {
 PAYMENT_METHODS = ["Cash", "GCash", "Maya", "Bank Transfer"]
 
 
+def summarize_payment_methods(totals):
+    grouped = [
+        ("Filtered Cash", float(totals.get("Cash", 0.0))),
+        ("E-Wallet", sum(float(totals.get(method, 0.0))
+                         for method in ("GCash", "Maya", "Bank Transfer"))),
+    ]
+    other_methods = [name for name in totals
+                     if name not in ("Cash", "GCash", "Maya", "Bank Transfer")]
+    grouped.extend((f"Filtered {method}", float(totals[method]))
+                   for method in other_methods)
+    return grouped
+
+
 def receipt_number(payment_date, payment_id):
     day = date.fromisoformat(str(payment_date)[:10]).strftime("%Y%m%d")
     return f"KGM-{day}-{int(payment_id):04d}"
@@ -104,7 +117,24 @@ class GymManager:
         if plan not in PLANS: raise ValueError("Choose a valid membership plan.")
         try: start = date.fromisoformat(start_text)
         except ValueError: raise ValueError("Start date must use YYYY-MM-DD.")
-        # Multiple memberships are allowed, including the same plan and start date.
+
+        outstanding = self.db.one("""SELECT m.id, m.plan_name,
+                MAX(m.plan_price - COALESCE(SUM(p.amount), 0), 0) AS balance
+            FROM memberships m
+            LEFT JOIN payments p ON p.membership_id = m.id
+            WHERE m.customer_id = ?
+            GROUP BY m.id
+            HAVING MAX(m.plan_price - COALESCE(SUM(p.amount), 0), 0) > 0.005
+            ORDER BY m.id
+            LIMIT 1""", (cid,))
+        if outstanding:
+            raise ValueError(
+                f"Renewal blocked: {outstanding['plan_name']} membership "
+                f"(ID {outstanding['id']}) still has an outstanding balance "
+                f"of ₱{outstanding['balance']:,.2f}. Settle the balance before "
+                "creating another membership."
+            )
+
         end = start + timedelta(days=PLANS[plan]["days"]-1)
         return self.db.run("""INSERT INTO memberships(customer_id,plan_name,start_date,end_date,plan_price)
           VALUES(?,?,?,?,?)""", (cid,plan,start.isoformat(),end.isoformat(),PLANS[plan]["price"]))
@@ -470,7 +500,7 @@ class GymApp(ctk.CTk):
         rows=self.db.all("SELECT id,full_name,phone FROM customers ORDER BY full_name COLLATE NOCASE")
         return rows,[f"{r['id']} - {r['full_name']} ({r['phone']})" for r in rows]
     def membership_page(self):
-        p=self.page("Memberships"); f=self.section(p,"Create / Renew Membership","Choose a customer, plan, and start date. End date and price update automatically.")
+        p=self.page("Memberships"); f=self.section(p,"Create / Renew Membership","Choose a customer, plan, and start date. Settle outstanding balances before creating another membership.")
         customer_rows,opts=self.choices()
         self.membership_customer_options={row["id"]:option for row,option in zip(customer_rows,opts)}
         self.editing_membership_id=None
@@ -700,8 +730,7 @@ class GymApp(ctk.CTk):
             where_sql+" GROUP BY p.method",params
         )
         totals={row["method"]:float(row["total"]) for row in method_totals}
-        methods=list(PAYMENT_METHODS)+[name for name in totals if name not in PAYMENT_METHODS]
-        summary.extend((f"Filtered {method}",totals.get(method,0.0)) for method in methods)
+        summary.extend(summarize_payment_methods(totals))
         for i,(label,value) in enumerate(summary):
             self.payment_summary.grid_columnconfigure(i,weight=1,uniform="payment_summary")
             card=ctk.CTkFrame(self.payment_summary,fg_color="white",corner_radius=8)
